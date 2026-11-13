@@ -1,0 +1,24 @@
+{
+  "name": "auto-answer-ext",
+  "private": true,
+  "version": "0.4.1",
+  "type": "module",
+  "description": "在线答题辅助扩展（学习通 / 智慧树）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "vue": "^3.5.45"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^3.0.0",
+    "@types/chrome": "^0.3.7",
+    "@types/node": "^26.6.6",
+    "@vitejs/plugin-vue": "^6.0.11",
+    "typescript": "^5.9.0",
+    "vite": "^8.3.8",
+    "vue-tsc": "^3.3.14"
+  }
+}
