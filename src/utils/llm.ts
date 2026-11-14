@@ -58,6 +58,16 @@ export async function askLLM(payload: LlmPayload): Promise<string> {
   return res.data.content
 }
 
+/** 仅发送图片给视觉模型，不做“去图重试”（OCR 无图无意义）。 */
+export async function askVision(payload: LlmPayload): Promise<string> {
+  if (!payload.images?.length) {
+    throw new LlmError('UNKNOWN', '缺少图片')
+  }
+  const res = await sendMessage({ type: 'LLM_CHAT', payload })
+  if (!res.ok) throw new LlmError(res.error.code, res.error.message)
+  return res.data.content
+}
+
 /**
  * 带图片的请求：模型不支持视觉（400/413/415/422）时自动去掉图片重试一次，
  * 并在本轮任务内记住降级状态，避免后续题目反复失败。

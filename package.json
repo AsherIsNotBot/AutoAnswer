@@ -1,7 +1,7 @@
 {
   "name": "auto-answer-ext",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.6.0",
   "type": "module",
   "description": "在线答题辅助扩展（学习通 / 智慧树）",
   "scripts": {

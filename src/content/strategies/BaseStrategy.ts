@@ -505,7 +505,7 @@ export abstract class BaseStrategy {
 
   // ---------------------------------------------------------------- 交卷
 
-  submit(): boolean {
+  submit(): boolean | Promise<boolean> {
     const button = this.findSubmitButton()
     if (!button) return false
     button.click()

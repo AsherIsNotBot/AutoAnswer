@@ -1,13 +1,21 @@
 /** 面板、策略与 background 共用的类型定义。 */
 
+export type ImageMode = 'ocr' | 'direct'
+
 export interface Settings {
   baseUrl: string
   apiKey: string
   model: string
   autoSubmit: boolean
-  /** 是否随请求发送题目图片（需要视觉模型） */
+  /** 是否识别题目图片 */
   enableImages: boolean
-  /** 视觉模型名称，留空则复用 model */
+  /** ocr：先转文字再答题；direct：视觉模型直接作答 */
+  imageMode: ImageMode
+  /** 视觉服务地址，留空复用 baseUrl */
+  visionBaseUrl: string
+  /** 视觉服务 Key，留空复用 apiKey */
+  visionApiKey: string
+  /** 视觉模型，留空复用 model */
   visionModel: string
 }
 
@@ -75,7 +83,13 @@ export interface FillResult {
   message?: string
 }
 
-export type ErrorCode = 'NO_CONFIG' | 'HTTP' | 'TIMEOUT' | 'PARSE' | 'UNKNOWN'
+export type ErrorCode =
+  | 'NO_CONFIG'
+  | 'HTTP'
+  | 'TIMEOUT'
+  | 'PARSE'
+  | 'RATE_LIMIT'
+  | 'UNKNOWN'
 
 export interface LlmPayload {
   prompt: string

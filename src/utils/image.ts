@@ -2,8 +2,8 @@ import type { Question, QuestionImage } from '../types'
 import { sendMessage } from './llm'
 
 const MAX_IMAGES_PER_QUESTION = 4
-const MAX_DIMENSION = 1400
-const MAX_DATA_URL_LENGTH = 2_500_000
+const MAX_DIMENSION = 1600
+const MAX_DATA_URL_LENGTH = 3_000_000
 const MAX_BLOB_BYTES = 12 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 12_000
 

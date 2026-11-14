@@ -2,8 +2,9 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import type { Answer, FillResult, Question, Settings } from '../types'
 import { DEFAULT_SETTINGS, getSettings, saveSettings } from '../utils/storage'
-import { LlmError, askLLM, askLLMWithVision, isVisionDisabled, resetVisionState, sendMessage, testConnection } from '../utils/llm'
+import { LlmError, askLLM, askLLMWithVision, askVision, isVisionDisabled, resetVisionState, sendMessage, testConnection } from '../utils/llm'
 import { countQuestionImages, flattenImageDataUrls, prepareQuestionImages } from '../utils/image'
+import { OCR_PROMPT, transcribeQuestionImages } from '../utils/ocr'
 import {
   ANSWER_SYSTEM_PROMPT,
   buildAnswerPrompt,
@@ -43,9 +44,39 @@ const tab = ref<'settings' | 'console'>('settings')
 const form = reactive<Settings>({ ...DEFAULT_SETTINGS })
 const saving = ref(false)
 const testing = ref(false)
+const testingVision = ref(false)
 const showKey = ref(false)
 const running = ref(false)
 const platformName = ref(createStrategy(location.host)?.platform ?? '')
+const visionPreset = ref('custom')
+
+const VISION_PRESETS: Record<
+  string,
+  { label: string; baseUrl: string; model: string }
+> = {
+  zhipu: {
+    label: '智谱免费视觉',
+    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    model: 'glm-4.1v-thinking-flash',
+  },
+  gemini: {
+    label: 'Gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    model: 'gemini-2.5-flash',
+  },
+  qwen: {
+    label: 'Qwen / DashScope',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-vl-plus',
+  },
+  ollama: {
+    label: '本地 Ollama',
+    baseUrl: 'http://localhost:11434/v1',
+    model: 'qwen2.5-vl:7b',
+  },
+}
+
+let ocrDisabled = false
 
 const notice = ref('')
 const noticeType = ref<NoticeType>('info')
@@ -67,6 +98,19 @@ const statusText = computed(() => {
   return '答题完成'
 })
 
+const visionSummary = computed(() => {
+  if (!form.enableImages) return ''
+  const hasCustom = Boolean(
+    form.visionBaseUrl.trim() || form.visionApiKey.trim() || form.visionModel.trim(),
+  )
+  if (!hasCustom) {
+    return `主模型：${form.model || '未配置'}（需支持视觉）`
+  }
+  const model = form.visionModel.trim() || form.model || '未配置'
+  const base = form.visionBaseUrl.trim() || form.baseUrl || '未配置'
+  return `视觉服务：${model} · ${base}`
+})
+
 function addLog(level: LogLevel, message: string): void {
   const time = new Date().toLocaleTimeString('zh-CN', { hour12: false })
   logs.value.unshift({ id: ++logSeq, time, level, message })
@@ -85,6 +129,107 @@ function setNotice(message: string, type: NoticeType = 'info'): void {
 function describeError(error: unknown): string {
   if (error instanceof LlmError) return `[${error.code}] ${error.message}`
   return error instanceof Error ? error.message : String(error)
+}
+
+function applyVisionPreset(): void {
+  const preset = VISION_PRESETS[visionPreset.value]
+  if (!preset) return
+  form.visionBaseUrl = preset.baseUrl
+  form.visionModel = preset.model
+}
+
+function createTestImage(): string {
+  const canvas = document.createElement('canvas')
+  canvas.width = 720
+  canvas.height = 260
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('无法创建测试图片')
+
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+  context.strokeStyle = '#2563eb'
+  context.lineWidth = 6
+  context.strokeRect(20, 20, 680, 220)
+  context.fillStyle = '#111827'
+  context.font = 'bold 44px sans-serif'
+  context.fillText('识图测试 ABC 123', 44, 110)
+  context.font = '30px sans-serif'
+  context.fillText('公式: E = mc²', 44, 175)
+
+  return canvas.toDataURL('image/jpeg', 0.9)
+}
+
+async function onTestVision(): Promise<void> {
+  if (testingVision.value) return
+  if (!form.enableImages) {
+    setNotice('请先开启图片识别', 'error')
+    return
+  }
+  if (!(await persist())) return
+
+  testingVision.value = true
+  setNotice('正在测试识图…', 'info')
+  addLog('info', `测试识图：${visionSummary.value}`)
+
+  try {
+    const started = performance.now()
+    const text = await askVision({
+      prompt: OCR_PROMPT,
+      images: [createTestImage()],
+      temperature: 0,
+    })
+    const elapsed = Math.round(performance.now() - started)
+    const preview = text.trim().slice(0, 160) || '(空)'
+    addLog('ok', `识图成功（${elapsed}ms）：${preview}`)
+    setNotice('识图成功', 'ok')
+  } catch (error) {
+    const hasVisionConfig = Boolean(
+      form.visionBaseUrl.trim() || form.visionApiKey.trim() || form.visionModel.trim(),
+    )
+    const hint = hasVisionConfig
+      ? ''
+      : '；当前使用主模型识图，请确认主模型支持视觉，或填写视觉服务'
+    const message = `${describeError(error)}${hint}`
+    addLog('error', `识图失败：${message}`)
+    setNotice(message, 'error')
+  } finally {
+    testingVision.value = false
+  }
+}
+
+async function recognizeQuestionImages(
+  question: Question,
+  label: string,
+): Promise<number> {
+  if (!form.enableImages || form.imageMode !== 'ocr' || ocrDisabled) return 0
+
+  const hasVisionConfig = Boolean(
+    form.visionBaseUrl.trim() || form.visionApiKey.trim() || form.visionModel.trim(),
+  )
+
+  try {
+    const result = await transcribeQuestionImages(question, {
+      onWarning: (message) => addLog('warn', `${label}${message}`),
+    })
+
+    if (result.total > 0 && result.transcribed === 0) {
+      addLog(
+        'warn',
+        `${label}图片文字识别失败${hasVisionConfig ? '' : '；当前使用主模型识图，请确认其支持视觉或配置视觉服务'}`,
+      )
+    } else if (result.transcribed > 0) {
+      addLog('info', `${label}已转写 ${result.transcribed}/${result.total} 张图片`)
+    }
+
+    return result.transcribed
+  } catch (error) {
+    ocrDisabled = true
+    addLog(
+      'error',
+      `${label}图片识别中断：${describeError(error)}；本轮后续题目按纯文本继续`,
+    )
+    return 0
+  }
 }
 
 async function load(): Promise<void> {
@@ -186,7 +331,13 @@ async function prepareQuestionImageSet(
   questions: Question[],
   label: string,
 ): Promise<number> {
-  if (!form.enableImages || isVisionDisabled()) return 0
+  if (
+    !form.enableImages ||
+    isVisionDisabled() ||
+    (form.imageMode === 'ocr' && ocrDisabled)
+  ) {
+    return 0
+  }
 
   let total = 0
   for (const question of questions) {
@@ -262,10 +413,21 @@ async function runPaged(strategy: BaseStrategy): Promise<void> {
       try {
         await prepareQuestionImageSet([question], `${taskLabel(task)} `)
 
-        const raw = await askWithOptionalImages(
-          buildAnswerPrompt([question]),
-          flattenImageDataUrls([question]),
-        )
+        const ocrMode = form.enableImages && form.imageMode === 'ocr'
+        if (ocrMode && !ocrDisabled) {
+          await recognizeQuestionImages(question, `${taskLabel(task)} `)
+        }
+
+        const raw = ocrMode
+          ? await askLLM({
+              prompt: buildAnswerPrompt([question], { includeImages: false }),
+              system: ANSWER_SYSTEM_PROMPT,
+              temperature: 0,
+            })
+          : await askWithOptionalImages(
+              buildAnswerPrompt([question]),
+              flattenImageDataUrls([question]),
+            )
         const answers = parseAnswerPayload(raw)
         const answer = answers.find((item) => item.id === question.id) ?? answers[0]
 
@@ -304,6 +466,7 @@ async function finishRun(
   strategy: BaseStrategy,
   frameWindows: Window[],
   aborted = false,
+  hasLocalQuestions = true,
 ): Promise<void> {
   const complete =
     !aborted &&
@@ -335,18 +498,24 @@ async function finishRun(
     return
   }
 
-  const submittedTop = strategy.submit()
-  const submittedFrame = await submitFrames(frameWindows)
+  // 题目全在 iframe 时，顶层页面没有交卷按钮，不要误点页面上的其他“提交”
+  const submittedTop = hasLocalQuestions ? await strategy.submit() : false
+  const frameOutcome = await submitFrames(frameWindows)
 
   // 智慧树的提交按钮在弹窗里异步点击，稍等后检查是否被“未完成题目”提示拦截
   await delay(800)
 
-  if (strategy.lastNotice) {
-    addLog('warn', strategy.lastNotice)
+  const notices = [
+    ...(strategy.lastNotice ? [strategy.lastNotice] : []),
+    ...frameOutcome.notices,
+  ]
+
+  if (notices.length > 0) {
+    for (const notice of new Set(notices)) addLog('warn', notice)
     return
   }
 
-  if (submittedTop || submittedFrame) {
+  if (submittedTop || frameOutcome.submitted) {
     addLog('ok', '已触发交卷')
   } else {
     addLog('warn', '未找到交卷按钮，请手动提交')
@@ -372,14 +541,17 @@ async function onStart(): Promise<void> {
   progress.failed = 0
   resetVisionState()
   visionFallbackNotified = false
+  ocrDisabled = false
 
   try {
-    addLog(
-      'info',
-      form.enableImages
-        ? `图片识别：开${form.visionModel ? `（视觉模型：${form.visionModel}）` : ''}`
-        : '图片识别：关，按纯文本作答',
-    )
+    if (form.enableImages) {
+      addLog(
+        'info',
+        `图片识别：${form.imageMode === 'ocr' ? '图片转文字' : '视觉模型直接作答'} · ${visionSummary.value}`,
+      )
+    } else {
+      addLog('info', '图片识别：关，按纯文本作答')
+    }
 
     if (strategy.paged) {
       await runPaged(strategy)
@@ -393,8 +565,17 @@ async function onStart(): Promise<void> {
       addLog('info', `当前页面解析到 ${ownQuestions.length} 道题`)
     }
 
-    const withImages = form.enableImages && !isVisionDisabled()
-    const frameResults = await requestQuestionsFromFrames(withImages)
+    const withImages =
+      form.enableImages &&
+      !isVisionDisabled() &&
+      !(form.imageMode === 'ocr' && ocrDisabled)
+    let frameResults = await requestQuestionsFromFrames(withImages)
+
+    // 嵌套 iframe 可能晚于顶层页面加载，零结果时稍等重试一次
+    if (frameResults.every((result) => result.questions.length === 0)) {
+      await delay(700)
+      frameResults = await requestQuestionsFromFrames(withImages)
+    }
 
     frameResults.forEach((result) => {
       result.warnings.forEach((warning) => addLog('warn', `[iframe] ${warning}`))
@@ -448,18 +629,41 @@ async function onStart(): Promise<void> {
     const tasksQuestions = tasks.map((task) => task.question)
     const images = flattenImageDataUrls(tasksQuestions)
     const imageCount = countQuestionImages(tasksQuestions)
+    const ocrMode = form.enableImages && form.imageMode === 'ocr'
+
     if (imageCount === 0) {
       if (form.enableImages && !isVisionDisabled()) {
         addLog('info', '未发现可发送的题目图片，按纯文本作答')
+      }
+    } else if (ocrMode) {
+      addLog('info', `共发现 ${images.length} 张图片，开始转写文字…`)
+
+      let transcribed = 0
+      for (const task of tasks) {
+        transcribed += await recognizeQuestionImages(
+          task.question,
+          `${taskLabel(task)} `,
+        )
+        if (ocrDisabled) break
+      }
+
+      if (transcribed > 0) {
+        addLog('info', `图片文字转写完成：${transcribed}/${images.length}`)
       }
     } else {
       addLog('info', `共附带 ${images.length} 张图片（${imageCount} 处）`)
     }
 
-    const raw = await askWithOptionalImages(
-      buildAnswerPrompt(tasksQuestions),
-      images,
-    )
+    const raw = ocrMode
+      ? await askLLM({
+          prompt: buildAnswerPrompt(tasksQuestions, { includeImages: false }),
+          system: ANSWER_SYSTEM_PROMPT,
+          temperature: 0,
+        })
+      : await askWithOptionalImages(
+          buildAnswerPrompt(tasksQuestions),
+          images,
+        )
 
     const answers = parseAnswerPayload(raw)
     if (answers.length === 0) {
@@ -516,7 +720,7 @@ async function onStart(): Promise<void> {
       }
     }
 
-    await finishRun(strategy, [...frameFills.keys()])
+    await finishRun(strategy, [...frameFills.keys()], false, ownQuestions.length > 0)
   } catch (error) {
     const message = describeError(error)
     addLog('error', `答题中断：${message}`)
@@ -539,7 +743,7 @@ onMounted(load)
       <div class="brand">
         <span class="dot" />
         <span class="title">Auto Answer AI</span>
-        <span class="badge">P6</span>
+        <span class="badge">P8</span>
       </div>
       <button
         class="icon-btn"
@@ -616,20 +820,80 @@ onMounted(load)
 
         <label class="switch-row">
           <input v-model="form.enableImages" type="checkbox" />
-          <span>发送题目图片</span>
-          <em>需视觉模型</em>
+          <span>图片识别</span>
+          <em>默认关闭</em>
         </label>
 
-        <label v-if="form.enableImages" class="field">
-          <span class="label">视觉模型（可选）</span>
-          <input
-            v-model="form.visionModel"
-            type="text"
-            placeholder="留空则复用上面的模型"
-            spellcheck="false"
-            autocomplete="off"
-          />
-        </label>
+        <template v-if="form.enableImages">
+          <label class="field">
+            <span class="label">图片处理方式</span>
+            <select v-model="form.imageMode">
+              <option value="ocr">图片转文字（推荐）</option>
+              <option value="direct">视觉模型直接作答</option>
+            </select>
+          </label>
+
+          <div class="vision-section">
+            <div class="vision-head">
+              <span class="label">视觉服务（可选）</span>
+              <span class="vision-summary">{{ visionSummary }}</span>
+            </div>
+
+            <label class="field">
+              <span class="label">视觉 Base URL</span>
+              <input
+                v-model="form.visionBaseUrl"
+                type="text"
+                placeholder="留空使用主模型地址"
+                spellcheck="false"
+                autocomplete="off"
+              />
+            </label>
+
+            <label class="field">
+              <span class="label">视觉 API Key</span>
+              <input
+                v-model="form.visionApiKey"
+                type="password"
+                placeholder="留空使用主 Key"
+                spellcheck="false"
+                autocomplete="off"
+              />
+            </label>
+
+            <label class="field">
+              <span class="label">视觉模型</span>
+              <input
+                v-model="form.visionModel"
+                type="text"
+                placeholder="留空使用主模型"
+                spellcheck="false"
+                autocomplete="off"
+              />
+            </label>
+
+            <div class="preset-row">
+              <select v-model="visionPreset" @change="applyVisionPreset">
+                <option value="custom">自定义</option>
+                <option
+                  v-for="(preset, key) in VISION_PRESETS"
+                  :key="key"
+                  :value="key"
+                >
+                  {{ preset.label }}
+                </option>
+              </select>
+              <button
+                class="mini-btn"
+                type="button"
+                :disabled="testingVision"
+                @click="onTestVision"
+              >
+                {{ testingVision ? '识图中…' : '测试识图' }}
+              </button>
+            </div>
+          </div>
+        </template>
 
         <div class="actions">
           <button class="btn primary" type="button" :disabled="saving" @click="onSave">
@@ -643,7 +907,8 @@ onMounted(load)
         <p v-if="notice" class="notice" :class="noticeType">{{ notice }}</p>
         <p class="tip">
           配置保存在 chrome.storage.local（明文），请勿在共用电脑上使用。
-          开启图片发送后，图片会上传到所配置的 LLM 接口；纯文本模型会自动去图重试。
+          开启图片识别后，图片会上传到视觉服务；视觉服务留空时使用主模型。
+          OCR 模式会先把图片转成文字，再交给答题模型。
         </p>
       </section>
 
@@ -693,7 +958,7 @@ onMounted(load)
         </ul>
       </section>
 
-      <footer class="footer">v0.4.1 · 仅用于被授权的练习环境</footer>
+      <footer class="footer">v0.6.0 · 仅用于被授权的练习环境</footer>
     </template>
   </div>
 </template>

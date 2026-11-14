@@ -10,7 +10,7 @@ export class XueXiTongStrategy extends BaseStrategy {
 
   protected readonly selectors: StrategySelectors = {
     question: ['.questionLi', '.TiMu', '.Zy_TItle .TiMu'],
-    stem: ['.mark_name', '.Zy_TItle .fl', '.Zy_TItle', '.question-title'],
+    stem: ['.mark_name', '.Zy_TItle .fontLabel', '.Zy_TItle', '.question-title'],
     option: ['.num_option', '.stem_answer .answerBg', '.answerBg'],
     blank: ['textarea', 'input[type="text"]'],
   }

@@ -285,7 +285,7 @@ export class ZhiHuiShuStrategy extends BaseStrategy {
     if (this.clickDialogSubmit()) return true
 
     const trigger = document.querySelector<HTMLElement>('.Submithomeworkbtn')
-    if (!trigger) return super.submit()
+    if (!trigger) return Boolean(super.submit())
 
     trigger.click()
 

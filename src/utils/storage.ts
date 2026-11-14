@@ -8,6 +8,9 @@ export const DEFAULT_SETTINGS: Settings = {
   model: 'deepseek-chat',
   autoSubmit: false,
   enableImages: false,
+  imageMode: 'ocr',
+  visionBaseUrl: '',
+  visionApiKey: '',
   visionModel: '',
 }
 
@@ -18,6 +21,11 @@ function normalize(input: Partial<Settings>): Settings {
     model: String(input.model ?? DEFAULT_SETTINGS.model).trim(),
     autoSubmit: Boolean(input.autoSubmit),
     enableImages: Boolean(input.enableImages),
+    imageMode: input.imageMode === 'direct' ? 'direct' : 'ocr',
+    visionBaseUrl: String(input.visionBaseUrl ?? DEFAULT_SETTINGS.visionBaseUrl)
+      .trim()
+      .replace(/\/+$/, ''),
+    visionApiKey: String(input.visionApiKey ?? DEFAULT_SETTINGS.visionApiKey).trim(),
     visionModel: String(input.visionModel ?? DEFAULT_SETTINGS.visionModel).trim(),
   }
 }

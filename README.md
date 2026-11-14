@@ -2,7 +2,7 @@
 
 悬浮式在线答题辅助浏览器扩展，面向学习通（chaoxing.com）与智慧树（zhihuishu.com）。
 
-当前为 **P6 可用版本**：已打通「解析题目 → 请求大模型 → 解析答案 → 自动填涂 → 可选交卷」完整链路，支持 iframe 内嵌题目、智慧树新版「一页一题」作业页，以及题干/选项中的图片题（视觉模型 + 文本降级）。
+当前为 **P8 可用版本**：已打通「解析题目 → 请求大模型 → 解析答案 → 自动填涂 → 可选交卷」完整链路，支持多层嵌套 iframe、智慧树组合题/分页作业页、学习通作业/考试页，以及图片题（OCR 转文字或视觉模型直接作答，视觉服务可独立配置）。
 
 ## 技术栈
 
@@ -37,15 +37,19 @@ npm run build   # 类型检查 + 生产构建，产物在 dist/
 | API Key | 以 `Bearer` 方式发送，保存在 `chrome.storage.local`（明文） |
 | 模型 | 例如 `deepseek-chat`、`gpt-4o-mini` 等 |
 | 自动交卷 | 打开后，仅在**全部题目填写成功且无跳过/失败**时才弹出确认框；未完成时自动跳过交卷 |
-| 发送题目图片 | 默认关闭。开启后题目中的图片会压缩并随请求发送；需模型支持视觉 |
-| 视觉模型 | 可选。留空复用「模型」；填写后仅在带图片的请求中使用 |
+| 图片识别 | 默认关闭。开启后可选择 OCR 或视觉模型直接作答 |
+| 图片处理方式 | `图片转文字`：先用视觉模型 OCR，再把文字拼进题干交给答题模型；`视觉模型直接作答`：图片随题目一起发给视觉模型 |
+| 视觉 Base URL / Key / 模型 | 全部可选，逐项留空回退主模型配置；支持任意 OpenAI 兼容视觉服务（智谱、Gemini、Qwen、Ollama 等） |
+| 视觉预设 | 智谱免费视觉 / Gemini / Qwen / Ollama，仅填充地址与模型名，Key 需自行填写 |
+| 测试识图 | 生成一张本地测试图，调用当前生效的视觉服务并显示识别结果 |
 
 图片处理规则：
 
 - 单题最多 4 张，单次请求最多 8 张，总大小受限
-- 最长边 1400px、JPEG 压缩；同一图片按地址缓存
+- 最长边 1600px、JPEG 压缩；同一图片按地址与内容缓存
 - 同源图片由页面直接抓取；跨域或 CORS 受限图片由 Background 代理抓取
-- 模型不支持视觉（HTTP 400/413/415/422）时自动去掉图片重试一次，本轮后续题目按纯文本作答，并在日志中提示
+- OCR 模式逐张转写，结果按图片 hash 缓存；限流时自动退避重试
+- 视觉配置留空时使用主模型的地址、Key 和模型；主模型不支持视觉会在日志中明确提示
 
 「控制台」Tab：
 
@@ -63,17 +67,20 @@ src/
 ├── content/
 │   ├── index.ts                  # 所有 frame 启动代理；仅顶层挂载 Shadow DOM 面板
 │   ├── App.vue                   # 设置 / 控制台双 Tab，答题编排
-│   ├── bridge.ts                 # 跨 iframe postMessage 协议（解析 / 填涂 / 交卷）
+│   ├── bridge.ts                 # 跨 iframe 递归解析/填涂/交卷协议
+│   ├── mainWorld.ts              # MAIN world：调用 UEditor API 写入填空
 │   ├── style.css                 # 以 ?inline 字符串注入 shadowRoot
 │   └── strategies/
 │       ├── BaseStrategy.ts       # 通用解析、事件模拟、交卷逻辑
-│       ├── XueXiTong.ts          # 学习通选择器
+│       ├── XueXiTong.ts          # 学习通练习页选择器
+│       ├── XueXiTongWork.ts      # 学习通作业/考试页：.singleQuesId / UEditor
 │       ├── ZhiHuiShu.ts          # 智慧树选择器 + 分页答题/交卷流程
 │       └── index.ts              # createStrategy 工厂
 ├── utils/
 │   ├── storage.ts                # chrome.storage.local 的 Promise 封装
-│   ├── llm.ts                    # askLLM / askLLMWithVision / 视觉降级 / 错误类型
+│   ├── llm.ts                    # askLLM / askVision / 视觉降级 / 错误类型
 │   ├── image.ts                  # 图片收集、懒加载等待、抓取、压缩、缓存
+│   ├── ocr.ts                    # OCR Prompt、逐图转写、hash 缓存、限流重试
 │   └── prompt.ts                 # Prompt 模板、图片标记、JSON 容错提取与答案归一化
 ├── types.ts                      # Settings、消息协议、Question / Answer
 └── vite-env.d.ts
@@ -82,19 +89,22 @@ src/
 ## 关键设计
 
 - **样式隔离**：CSS 通过 `?inline` 导入为字符串，写入 Shadow DOM；宿主节点 `all: initial` + 固定定位 + 最大 z-index。
-- **iframe 支持**：`all_frames: true`。顶层只渲染一个面板；每个 frame 内运行轻量代理，接收 `postMessage` 后本地解析/填涂，结果回传顶层汇总。跨域 iframe 同样可用。
+- **iframe 支持**：`all_frames: true`。顶层只渲染一个面板；每个 frame 内运行轻量代理。解析、填涂、交卷都会向子 frame 递归转发，支持「顶层 → cards → work」这类多层嵌套结构；题目 id 用 `c0:`、`c1:` 前缀逐层路由。
+- **学习通作业页**：自动识别 `.singleQuesId .TiMu` 结构，题干取 `.Zy_TItle .fontLabel`，选项取 `li.before-after`（字母 `.num_option` + 正文 `a.after`），点击 `li` 触发 `addChoice`；填空通过 MAIN world 内容脚本调用 UEditor 的 `window.UE.getEditor(id).setContent()`。
 - **策略模式**：`BaseStrategy` 实现通用 DOM 解析与填涂；平台子类只声明选择器，页面改版时单点修改。
 - **分页式答题**：`paged` 策略通过 `.questionBox` + `.Topicswitching-div` 识别「一页一题」页面；先点答题卡回到第一项，之后每题解析 → 请求 → 填涂 → 切下一项。切换结果分为 `moved / last / failed`：只有确认到达最后一项才结束，切换失败立即停止且不交卷。
 - **组合题**：智慧树的 `.questionBox` 可能同时包含组合题父题干和当前子题。解析时取最后一个 `.questionTit` 所在子题块，题号（如 `1.2`）、题型、填空/选项都来自当前子题；父题干作为「组合题背景」一起发给模型。导航签名同时包含答题卡当前高亮项，避免 `1.1 → 1.2` 被误判为页面没变化。
-- **交卷保护**：只有 `已填 === 总题数` 且 `跳过 = 失败 = 0` 才允许自动交卷；智慧树弹窗若包含「未作答 / 未完成 / 还有 N 题」等警告，不会点击提交。
+- **交卷保护**：只有 `已填 === 总题数` 且 `跳过 = 失败 = 0` 才允许自动交卷；智慧树 / 学习通弹窗若包含「未作答 / 未完成 / 还有 N 题」等警告，不会点击提交，并把警告回传到控制台。学习通的提交确认框会等待 `validate` 请求完成后再判定，最多 6 秒。题目全在 iframe 时顶层页面不会误点自己的「提交」链接。
 - **事件模拟**：radio/checkbox 使用原生 `checked` setter + `mousedown/mouseup/click/change`；输入框使用原型 setter + `input/change/blur`，兼容 Vue/React 受控组件。
-- **图片题**：解析阶段收集题干/选项中的 `img`（兼容懒加载 `data-src`），请求前在当前 frame 内抓取并用 canvas 压缩；跨域失败时由 Background 凭 `<all_urls>` 权限代理抓取。图片以 OpenAI 兼容的 `image_url` data URL 追加到消息中，Prompt 用「题目2 图片1（题干配图）」标注顺序；视觉模型不支持时自动去图重试。
+- **图片题**：解析阶段收集题干/选项中的 `img`（兼容懒加载 `data-src`），请求前在当前 frame 内抓取并用 canvas 压缩；跨域失败时由 Background 凭 `<all_urls>` 权限代理抓取。
+- **视觉服务**：视觉 Base URL / Key / 模型均可独立填写，逐项留空回退主模型；图片请求在 Background 选择视觉配置，纯文本请求仍走主配置。
+- **OCR 模式**：先用视觉模型逐张转写图片（公式 LaTeX、表格 Markdown），把结果拼进题干，再交给答题模型；图片内容不进入答题请求，适合“免费视觉 + 文本模型答题”的组合。视觉模型直接作答模式保留，图片按「题目2 图片1」标注顺序附加。
 - **答案容错**：Prompt 强制纯 JSON；解析器容忍代码块、前后废话、`{answers:[...]}` 包裹与 `{id: answer}` 映射。
 - **请求代理**：API Key 与 LLM 请求都在 background 完成，Content Script 只传 prompt。
 
 ## 当前进度
 
-已完成（P0–P6）：
+已完成（P0–P8）：
 
 - [x] Vite + Vue 3 + TS + CRXJS 工程与 MV3 manifest
 - [x] Shadow DOM 面板注入（右下角、可折叠）
@@ -109,6 +119,11 @@ src/
 - [x] 智慧树新版作业页：`.questionBox` 解析、Element UI 选项、答题卡回第一题、逐题「下一题」、弹窗交卷
 - [x] 智慧树组合题：父题干 + 当前子题（1.1 / 1.2）解析，题号/题型/填空取自当前子题
 - [x] 图片题：题干/选项图片收集、压缩、缓存、跨域代理、多模态请求、视觉不支持时文本降级
+- [x] 图片 OCR：独立视觉服务配置（留空回退主模型）、图片转文字、hash 缓存、限流退避重试
+- [x] 学习通作业/考试页：`.singleQuesId .TiMu` 解析、选项 li 点击、UEditor 填空、确认提交
+- [x] 多层嵌套 iframe：解析/填涂/交卷递归路由，支持 cards → work 结构；题目 id 前缀与 frame 下标稳定对应
+- [x] 视觉服务预设：智谱免费视觉 / Gemini / Qwen / Ollama，自定义 OpenAI 兼容接口
+- [x] 「测试识图」：本地生成测试图验证视觉服务是否可用
 - [x] 交卷安全闸门：未答完、切换失败、平台提示未作答时均不会自动提交
 
 后续可做：
@@ -132,14 +147,21 @@ src/
 - 智慧树新版作业页（按 `hiexam.zhihuishu.com` 保存文件里的真实 DOM 复刻）：`.questionBox` + `.questionTit` / `.questionContent`，3 题（问答/单选/多选）全部填涂成功，答题卡显示 3/3；开启自动交卷后 `.Submithomeworkbtn` → 弹窗 `.Submissionbtn` 链路成功触发
 - 智慧树组合题（按 `test.html` 复刻）：答题卡 `1.1 / 1.2 / 2 / 3`，父题干保留、子题切换；`1.1` 两个填空、`1.2` 问答、后两题单选，4/4 全部填涂，题号与题型正确（`#1.1 [填空]`、`#1.2 [简答]`）
 - 交卷闸门：模型只返回部分答案时日志为 `答题未完成：已填 0/4…已跳过自动交卷`，不弹确认、不提交；4/4 完成但平台弹「还有 2 题未作答」时，扩展拒绝点击提交并记录警告
+- 学习通作业页（按保存的真实 `work.html` 复刻，顶层 → cards → work 两层 iframe）：10 题全部识别（3 单选 / 1 填空 / 6 判断），题干与选项正文正确；9 个选项各点击 1 次、隐藏答案分别写入 `A` 与 `true`，填空经 UEditor 桥写入；自动交卷穿过两层 frame 点到「提交」并在确认框点「确定」。平台弹「还有 2 题未作答」时拒绝点击并回传警告
 - 图片题：题干同源图片 + 选项跨域图片（无 CORS 头）共 2 张，请求体为 `text + image_url` 数组，`visionModel` 生效，3 题全部填涂
 - 视觉降级：纯文本 mock 接口对多模态内容返回 400，扩展自动去掉图片重试成功，日志提示「模型不支持视觉输入，已去掉图片重试」，3 题仍全部填涂
+- OCR + 独立视觉服务：主模型 `mock-main`、视觉服务 `mock-vision`；2 张图片各发一次 `/vision` 请求（带视觉 Key），答题请求只发 `/main` 且不含图片，题干已包含 `【图片文字】`，3/3 填涂
+- OCR 留空回退：视觉三项留空后，识别请求与答题请求都走主模型 Base URL/Key；主模型收到图片并返回转写文字，随后文本请求正常答题
+- 预设与测试识图：选择「智谱免费视觉」正确填充 `https://open.bigmodel.cn/api/paas/v4` + `glm-4.1v-thinking-flash`；「测试识图」成功返回识别文本与耗时
 
 ## 已知限制
 
 - 智慧树选择题选项按 Element UI 的 `label.el-radio` / `label.el-checkbox` 适配；若真实页面选项是其他自定义结构，需要在 `ZhiHuiShu.ts` 的 `selectors.option` 补选择器
 - 分页式页面（一页一题）当前是**每题一次模型请求**，题量大时耗时与费用会增加
 - 图片单题最多 4 张、单次请求最多 8 张；超出部分会跳过并在日志提示
+- OCR 质量取决于视觉模型；复杂公式、手写体、低清截图建议使用更强的视觉模型
+- 免费视觉服务通常受并发/速率限制（如智谱 1302/1305），扩展会退避重试，仍失败则本轮跳过 OCR
+- OCR 结果缓存在内存中，刷新页面或重载扩展后清空
 - 顶层通过 `postMessage` 只向**直接子 iframe** 发起解析；多层嵌套需要后续补转发
 - API Key 以明文保存在 `chrome.storage.local`，请勿在共用设备上使用
 - 本工具只做页面 DOM 读写与大模型调用，不破解平台校验；请仅在自测、练习或已获授权的场景使用

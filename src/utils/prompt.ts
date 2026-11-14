@@ -40,9 +40,19 @@ const LABEL_TYPES: Record<string, QuestionType> = {
   short: 'short',
 }
 
+export interface PromptOptions {
+  /** OCR 模式下为 false：图片已转成文字，不再向答题模型声明 images */
+  includeImages?: boolean
+}
+
 /** 组装发给模型的题目列表，只保留可序列化字段。 */
-export function buildAnswerPrompt(questions: Question[]): string {
-  const hasImages = questions.some((question) => (question.images?.length ?? 0) > 0)
+export function buildAnswerPrompt(
+  questions: Question[],
+  options: PromptOptions = {},
+): string {
+  const includeImages = options.includeImages ?? true
+  const hasImages =
+    includeImages && questions.some((question) => (question.images?.length ?? 0) > 0)
 
   const payload = questions.map((question) => ({
     id: question.id,
@@ -54,9 +64,13 @@ export function buildAnswerPrompt(questions: Question[]): string {
       text: option.text,
     })),
     blanks: question.blanks,
-    images: (question.images ?? []).map(
-      (image) => image.label ?? `题目${question.number} 配图`,
-    ),
+    ...(includeImages
+      ? {
+          images: (question.images ?? []).map(
+            (image) => image.label ?? `题目${question.number} 配图`,
+          ),
+        }
+      : {}),
   }))
 
   const imageNote = hasImages

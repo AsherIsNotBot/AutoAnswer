@@ -139,7 +139,8 @@
 }
 
 .field input[type='text'],
-.field input[type='password'] {
+.field input[type='password'],
+.field select {
   width: 100%;
   padding: 7px 9px;
   border: 1px solid #dbe2ea;
@@ -152,7 +153,12 @@
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.field input:focus {
+.field select {
+  cursor: pointer;
+}
+
+.field input:focus,
+.field select:focus {
   border-color: #2563eb;
   background: #fff;
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
@@ -187,6 +193,52 @@
 
 .mini-btn:hover {
   border-color: #94a3b8;
+}
+
+.vision-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+  background: #fbfdff;
+}
+
+.vision-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.vision-summary {
+  font-size: 10px;
+  line-height: 1.45;
+  color: #64748b;
+  word-break: break-all;
+}
+
+.preset-row {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.preset-row select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #dbe2ea;
+  border-radius: 8px;
+  background: #fff;
+  color: #334155;
+  font-size: 11px;
+  font-family: inherit;
+  outline: none;
+}
+
+.preset-row .mini-btn {
+  padding: 6px 10px;
 }
 
 .switch-row {
@@ -438,10 +490,26 @@
   }
 
   .field input[type='text'],
-  .field input[type='password'] {
+  .field input[type='password'],
+  .field select {
     background: #1f2937;
     border-color: #334155;
     color: #f9fafb;
+  }
+
+  .vision-section {
+    background: #0b1220;
+    border-color: #1f2937;
+  }
+
+  .vision-summary {
+    color: #94a3b8;
+  }
+
+  .preset-row select {
+    background: #1f2937;
+    border-color: #334155;
+    color: #cbd5e1;
   }
 
   .mini-btn,

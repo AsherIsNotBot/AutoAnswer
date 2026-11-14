@@ -85,16 +85,41 @@ async function handleChat(payload: LlmPayload): Promise<{ content: string; model
   }
 
   const settings = await getSettings()
-  if (!settings.apiKey) {
-    throw new AppError('NO_CONFIG', '请先在面板「设置」中填写 API Key')
+  const images = sanitizeImages(payload.images)
+  const useVision = images.length > 0
+
+  // 视觉配置逐项回退主配置：留空即使用答题模型的对应配置
+  const baseUrl = useVision
+    ? settings.visionBaseUrl || settings.baseUrl
+    : settings.baseUrl
+  const apiKey = useVision
+    ? settings.visionApiKey || settings.apiKey
+    : settings.apiKey
+  const model = useVision
+    ? settings.visionModel || settings.model
+    : settings.model
+
+  if (!apiKey) {
+    throw new AppError(
+      'NO_CONFIG',
+      useVision
+        ? '请填写视觉服务 API Key（留空会复用主模型 Key）'
+        : '请先在面板「设置」中填写 API Key',
+    )
   }
-  if (!settings.model) {
-    throw new AppError('NO_CONFIG', '请先在面板「设置」中填写模型名称')
+  if (!model) {
+    throw new AppError(
+      'NO_CONFIG',
+      useVision
+        ? '请填写视觉模型名称（留空会复用主模型）'
+        : '请先在面板「设置」中填写模型名称',
+    )
+  }
+  if (!baseUrl) {
+    throw new AppError('NO_CONFIG', '请填写模型 Base URL')
   }
 
-  const endpoint = resolveEndpoint(settings.baseUrl)
-  const images = sanitizeImages(payload.images)
-  const model = images.length > 0 ? settings.visionModel || settings.model : settings.model
+  const endpoint = resolveEndpoint(baseUrl)
 
   const userContent =
     images.length > 0
@@ -118,7 +143,7 @@ async function handleChat(payload: LlmPayload): Promise<{ content: string; model
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${settings.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model,
@@ -139,8 +164,27 @@ async function handleChat(payload: LlmPayload): Promise<{ content: string; model
   }
 
   if (!response.ok) {
-    const body = (await response.text().catch(() => '')).slice(0, 300)
-    throw new AppError('HTTP', `HTTP ${response.status} ${response.statusText}${body ? `：${body}` : ''}`)
+    const body = (await response.text().catch(() => '')).slice(0, 500)
+    if (
+      response.status === 429 ||
+      /"code"\s*:\s*"?1302"?/.test(body) ||
+      body.includes('1302')
+    ) {
+      throw new AppError('RATE_LIMIT', `触发速率限制（1302/429）：${body || '请稍后重试'}`)
+    }
+    if (body.includes('1305')) {
+      throw new AppError('RATE_LIMIT', `平台过载（1305）：${body}`)
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new AppError(
+        'HTTP',
+        `HTTP ${response.status}：API Key 无效或无权限${body ? `：${body}` : ''}`,
+      )
+    }
+    throw new AppError(
+      'HTTP',
+      `HTTP ${response.status} ${response.statusText}${body ? `：${body}` : ''}`,
+    )
   }
 
   let json: unknown
@@ -152,8 +196,21 @@ async function handleChat(payload: LlmPayload): Promise<{ content: string; model
 
   const data = json as {
     model?: string
+    error?: { code?: string | number; message?: string }
     choices?: Array<{ message?: { content?: unknown } }>
   }
+
+  if (data.error) {
+    const code = String(data.error.code ?? '')
+    if (code === '1302' || code === '1305') {
+      throw new AppError('RATE_LIMIT', `平台限流（${code}）：${data.error.message ?? ''}`)
+    }
+    throw new AppError(
+      'HTTP',
+      `接口错误${code ? ` ${code}` : ''}：${data.error.message ?? '未知错误'}`,
+    )
+  }
+
   const content = normalizeContent(data?.choices?.[0]?.message?.content)
   if (!content.trim()) {
     throw new AppError('PARSE', '响应缺少 choices[0].message.content，可能不是 OpenAI 兼容接口')
