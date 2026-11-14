@@ -138,6 +138,23 @@
   letter-spacing: 0.2px;
 }
 
+.key-state {
+  margin-left: 6px;
+  font-style: normal;
+  font-weight: 500;
+  color: #15803d;
+}
+
+.key-state.missing {
+  color: #b45309;
+}
+
+.field-tip {
+  font-size: 10px;
+  line-height: 1.5;
+  color: #94a3b8;
+}
+
 .field input[type='text'],
 .field input[type='password'],
 .field select {

@@ -1,7 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import type { Answer, FillResult, Question, Settings } from '../types'
-import { DEFAULT_SETTINGS, getSettings, saveSettings } from '../utils/storage'
+import type {
+  Answer,
+  FillResult,
+  PanelSettings,
+  PublicSettings,
+  PublicSettingsResponseData,
+  Question,
+  SecretField,
+} from '../types'
+import { DEFAULT_PANEL_SETTINGS } from '../utils/storage'
 import { LlmError, askLLM, askLLMWithVision, askVision, isVisionDisabled, resetVisionState, sendMessage, testConnection } from '../utils/llm'
 import { countQuestionImages, flattenImageDataUrls, prepareQuestionImages } from '../utils/image'
 import { OCR_PROMPT, transcribeQuestionImages } from '../utils/ocr'
@@ -41,11 +49,14 @@ interface RoutedQuestion {
 const collapsed = ref(false)
 const tab = ref<'settings' | 'console'>('settings')
 
-const form = reactive<Settings>({ ...DEFAULT_SETTINGS })
+const form = reactive<PanelSettings>({ ...DEFAULT_PANEL_SETTINGS })
+const secretStatus = reactive({ apiKey: false, visionApiKey: false })
+// 只写不读：Key 不会从后台回填到面板，输入后保存即清空
+const apiKeyDraft = ref('')
+const visionKeyDraft = ref('')
 const saving = ref(false)
 const testing = ref(false)
 const testingVision = ref(false)
-const showKey = ref(false)
 const running = ref(false)
 const platformName = ref(createStrategy(location.host)?.platform ?? '')
 const visionPreset = ref('custom')
@@ -98,12 +109,17 @@ const statusText = computed(() => {
   return '答题完成'
 })
 
+const hasVisionConfig = computed(() =>
+  Boolean(
+    form.visionBaseUrl.trim() ||
+      form.visionModel.trim() ||
+      secretStatus.visionApiKey,
+  ),
+)
+
 const visionSummary = computed(() => {
   if (!form.enableImages) return ''
-  const hasCustom = Boolean(
-    form.visionBaseUrl.trim() || form.visionApiKey.trim() || form.visionModel.trim(),
-  )
-  if (!hasCustom) {
+  if (!hasVisionConfig.value) {
     return `主模型：${form.model || '未配置'}（需支持视觉）`
   }
   const model = form.visionModel.trim() || form.model || '未配置'
@@ -183,10 +199,7 @@ async function onTestVision(): Promise<void> {
     addLog('ok', `识图成功（${elapsed}ms）：${preview}`)
     setNotice('识图成功', 'ok')
   } catch (error) {
-    const hasVisionConfig = Boolean(
-      form.visionBaseUrl.trim() || form.visionApiKey.trim() || form.visionModel.trim(),
-    )
-    const hint = hasVisionConfig
+    const hint = hasVisionConfig.value
       ? ''
       : '；当前使用主模型识图，请确认主模型支持视觉，或填写视觉服务'
     const message = `${describeError(error)}${hint}`
@@ -203,10 +216,6 @@ async function recognizeQuestionImages(
 ): Promise<number> {
   if (!form.enableImages || form.imageMode !== 'ocr' || ocrDisabled) return 0
 
-  const hasVisionConfig = Boolean(
-    form.visionBaseUrl.trim() || form.visionApiKey.trim() || form.visionModel.trim(),
-  )
-
   try {
     const result = await transcribeQuestionImages(question, {
       onWarning: (message) => addLog('warn', `${label}${message}`),
@@ -215,7 +224,7 @@ async function recognizeQuestionImages(
     if (result.total > 0 && result.transcribed === 0) {
       addLog(
         'warn',
-        `${label}图片文字识别失败${hasVisionConfig ? '' : '；当前使用主模型识图，请确认其支持视觉或配置视觉服务'}`,
+        `${label}图片文字识别失败${hasVisionConfig.value ? '' : '；当前使用主模型识图，请确认其支持视觉或配置视觉服务'}`,
       )
     } else if (result.transcribed > 0) {
       addLog('info', `${label}已转写 ${result.transcribed}/${result.total} 张图片`)
@@ -232,9 +241,25 @@ async function recognizeQuestionImages(
   }
 }
 
+function applyPublicSettings(settings: PublicSettings): void {
+  form.baseUrl = settings.baseUrl
+  form.model = settings.model
+  form.autoSubmit = settings.autoSubmit
+  form.enableImages = settings.enableImages
+  form.imageMode = settings.imageMode
+  form.visionBaseUrl = settings.visionBaseUrl
+  form.visionModel = settings.visionModel
+  secretStatus.apiKey = settings.hasApiKey
+  secretStatus.visionApiKey = settings.hasVisionApiKey
+}
+
 async function load(): Promise<void> {
   try {
-    Object.assign(form, await getSettings())
+    const res = await sendMessage<PublicSettingsResponseData>({
+      type: 'GET_PUBLIC_SETTINGS',
+    })
+    if (!res.ok) throw new LlmError(res.error.code, res.error.message)
+    applyPublicSettings(res.data.settings)
   } catch (error) {
     setNotice(`读取配置失败：${describeError(error)}`, 'error')
   }
@@ -247,12 +272,37 @@ async function load(): Promise<void> {
   }
 }
 
+async function saveSecret(field: SecretField, value: string): Promise<PublicSettings> {
+  const res = await sendMessage<PublicSettingsResponseData>({
+    type: 'SET_SECRET',
+    field,
+    value,
+  })
+  if (!res.ok) throw new LlmError(res.error.code, res.error.message)
+  return res.data.settings
+}
+
+async function onClearSecret(field: SecretField): Promise<void> {
+  try {
+    const settings = await saveSecret(field, '')
+    secretStatus[field] = field === 'apiKey'
+      ? settings.hasApiKey
+      : settings.hasVisionApiKey
+    if (field === 'apiKey') apiKeyDraft.value = ''
+    else visionKeyDraft.value = ''
+    setNotice('已清除 Key', 'ok')
+    addLog('info', field === 'apiKey' ? '已清除主模型 Key' : '已清除视觉 Key')
+  } catch (error) {
+    setNotice(`清除失败：${describeError(error)}`, 'error')
+  }
+}
+
 async function persist(): Promise<boolean> {
   if (!form.baseUrl.trim()) {
     setNotice('Base URL 不能为空', 'error')
     return false
   }
-  if (!form.apiKey.trim()) {
+  if (!secretStatus.apiKey && !apiKeyDraft.value.trim()) {
     setNotice('API Key 不能为空', 'error')
     return false
   }
@@ -263,7 +313,33 @@ async function persist(): Promise<boolean> {
 
   saving.value = true
   try {
-    Object.assign(form, await saveSettings({ ...form }))
+    // Key 单独发送，保存后立即从面板状态中清空
+    if (apiKeyDraft.value.trim()) {
+      const settings = await saveSecret('apiKey', apiKeyDraft.value.trim())
+      secretStatus.apiKey = settings.hasApiKey
+      apiKeyDraft.value = ''
+    }
+    if (visionKeyDraft.value.trim()) {
+      const settings = await saveSecret('visionApiKey', visionKeyDraft.value.trim())
+      secretStatus.visionApiKey = settings.hasVisionApiKey
+      visionKeyDraft.value = ''
+    }
+
+    const res = await sendMessage<PublicSettingsResponseData>({
+      type: 'SAVE_PUBLIC_SETTINGS',
+      patch: {
+        baseUrl: form.baseUrl,
+        model: form.model,
+        autoSubmit: form.autoSubmit,
+        enableImages: form.enableImages,
+        imageMode: form.imageMode,
+        visionBaseUrl: form.visionBaseUrl,
+        visionModel: form.visionModel,
+      },
+    })
+    if (!res.ok) throw new LlmError(res.error.code, res.error.message)
+    applyPublicSettings(res.data.settings)
+
     setNotice('设置已保存', 'ok')
     addLog('ok', `设置已保存（${form.model}）`)
     return true
@@ -532,6 +608,16 @@ async function onStart(): Promise<void> {
     return
   }
 
+  if (!secretStatus.apiKey && !apiKeyDraft.value.trim()) {
+    tab.value = 'settings'
+    setNotice('请先填写 API Key 并保存', 'error')
+    return
+  }
+  // 面板里刚输入的新 Key / 视觉 Key 先落盘，再开始请求
+  if (apiKeyDraft.value.trim() || visionKeyDraft.value.trim()) {
+    if (!(await persist())) return
+  }
+
   running.value = true
   tab.value = 'console'
   platformName.value = strategy.platform
@@ -786,19 +872,30 @@ onMounted(load)
         </label>
 
         <label class="field">
-          <span class="label">API Key</span>
+          <span class="label">
+            API Key
+            <em class="key-state" :class="{ missing: !secretStatus.apiKey }">
+              {{ secretStatus.apiKey ? '已配置' : '未配置' }}
+            </em>
+          </span>
           <div class="input-row">
             <input
-              v-model="form.apiKey"
-              :type="showKey ? 'text' : 'password'"
-              placeholder="sk-..."
+              v-model="apiKeyDraft"
+              type="password"
+              :placeholder="secretStatus.apiKey ? '留空则保持当前 Key' : 'sk-...'"
               spellcheck="false"
-              autocomplete="off"
+              autocomplete="new-password"
             />
-            <button class="mini-btn" type="button" @click="showKey = !showKey">
-              {{ showKey ? '隐藏' : '显示' }}
+            <button
+              class="mini-btn"
+              type="button"
+              :disabled="!secretStatus.apiKey"
+              @click="onClearSecret('apiKey')"
+            >
+              清除
             </button>
           </div>
+          <span class="field-tip">已保存的 Key 不回显；输入新 Key 后点「保存设置」。</span>
         </label>
 
         <label class="field">
@@ -851,14 +948,29 @@ onMounted(load)
             </label>
 
             <label class="field">
-              <span class="label">视觉 API Key</span>
-              <input
-                v-model="form.visionApiKey"
-                type="password"
-                placeholder="留空使用主 Key"
-                spellcheck="false"
-                autocomplete="off"
-              />
+              <span class="label">
+                视觉 API Key
+                <em class="key-state" :class="{ missing: !secretStatus.visionApiKey }">
+                  {{ secretStatus.visionApiKey ? '已配置' : '复用主 Key' }}
+                </em>
+              </span>
+              <div class="input-row">
+                <input
+                  v-model="visionKeyDraft"
+                  type="password"
+                  :placeholder="secretStatus.visionApiKey ? '留空则保持当前 Key' : '留空使用主 Key'"
+                  spellcheck="false"
+                  autocomplete="new-password"
+                />
+                <button
+                  class="mini-btn"
+                  type="button"
+                  :disabled="!secretStatus.visionApiKey"
+                  @click="onClearSecret('visionApiKey')"
+                >
+                  清除
+                </button>
+              </div>
             </label>
 
             <label class="field">
@@ -906,6 +1018,7 @@ onMounted(load)
 
         <p v-if="notice" class="notice" :class="noticeType">{{ notice }}</p>
         <p class="tip">
+          API Key 只保存在后台，面板不回显，请求也由后台发出。
           配置保存在 chrome.storage.local（明文），请勿在共用电脑上使用。
           开启图片识别后，图片会上传到视觉服务；视觉服务留空时使用主模型。
           OCR 模式会先把图片转成文字，再交给答题模型。
@@ -958,7 +1071,7 @@ onMounted(load)
         </ul>
       </section>
 
-      <footer class="footer">v0.6.0 · 仅用于被授权的练习环境</footer>
+      <footer class="footer">v0.6.1 · 仅用于被授权的练习环境</footer>
     </template>
   </div>
 </template>

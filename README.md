@@ -260,7 +260,7 @@ npm run dev        # 产物同样输出到 dist/
 | 字段 | 说明 |
 | --- | --- |
 | Base URL | OpenAI 兼容接口地址，默认 `https://api.deepseek.com/v1` |
-| API Key | 以 `Bearer` 方式发送，保存在 `chrome.storage.local`（明文） |
+| API Key | **只写不读**：已保存的 Key 不回显，输入新 Key 后点「保存设置」；请求由 Background 以 `Bearer` 方式发送 |
 | 模型 | 例如 `deepseek-chat`、`gpt-4o-mini`、`qwen-plus` |
 | 自动交卷 | 默认关闭。开启后仅在**全部题目填写成功**时弹确认框 |
 | 图片识别 | 默认关闭。开启后可选择 OCR 或视觉模型直接作答 |
@@ -377,6 +377,13 @@ npm run dev        # 产物同样输出到 dist/
 - 扩展是否已启用
 - 是否在安装 / 更新后刷新过页面
 
+### 页面脚本能读到我的 API Key 吗？
+
+- **已保存的 Key 不能**：面板是 `closed` Shadow DOM，页面拿不到 `shadowRoot`；Key 不回填到输入框，内容脚本只收到 `hasApiKey: true/false`
+- Key 只存在于 `chrome.storage.local` 和 Background 内存中，请求也由 Background 发出
+- **输入新 Key 时**：面板会阻止键盘 / 剪贴板事件冒泡，但页面若使用捕获阶段监听仍可能记录按键；建议在可信页面完成配置，或配置后不要在考试页重新输入
+- 错误信息会在返回面板前脱敏，避免服务商回显 Key 片段
+
 ---
 
 ## 12. 权限与隐私
@@ -389,7 +396,9 @@ npm run dev        # 产物同样输出到 dist/
 - API Key 以**明文**保存在 `chrome.storage.local`，请勿在共用设备上保存
 - 题面、图片只会发送到**你自己配置的模型接口**
 - 扩展不包含统计、埋点、远程配置，不会向第三方上传数据
-- LLM 请求全部在 Background Service Worker 中发出，页面脚本无法直接读取 Key
+- **API Key 不会进入网页 DOM**：面板使用 `closed` Shadow DOM，已保存的 Key 不回显；内容脚本只从 Background 获取不含 Key 的公开设置（`hasApiKey` 标记）
+- 面板内会阻止键盘 / 剪贴板事件冒泡，降低页面脚本记录输入的可能；但页面仍可通过捕获阶段监听键盘事件，因此不建议在不可信页面输入敏感 Key
+- LLM 请求全部在 Background Service Worker 中发出，并用当前 Key 对错误信息做脱敏
 
 ---
 
@@ -460,7 +469,8 @@ src/
 
 ## 15. 关键设计
 
-- **样式隔离**：CSS 通过 `?inline` 导入为字符串，写入 Shadow DOM；宿主节点 `all: initial` + 固定定位 + 最大 z-index。
+- **样式与面板隔离**：CSS 通过 `?inline` 导入为字符串，写入 `closed` Shadow DOM；宿主节点 `all: initial` + 固定定位 + 最大 z-index，页面脚本无法读取面板内容。面板内的键盘 / 剪贴板事件会阻止冒泡。
+- **Key 隔离**：完整设置（含 Key）只存在于 Background；内容脚本通过 `GET_PUBLIC_SETTINGS` 获得剥离 Key 的公开设置，Key 只能通过 `SET_SECRET` 单向写入，保存后输入框立即清空。
 - **iframe 支持**：`all_frames: true`。顶层只渲染一个面板；每个 frame 内运行轻量代理。解析、填涂、交卷都会向子 frame 递归转发，支持「顶层 → cards → work」这类多层嵌套；题目 id 用 `c0:`、`c1:` 前缀逐层路由，前缀与 frame 下标稳定对应。
 - **学习通作业页**：自动识别 `.singleQuesId .TiMu` 结构，题干取 `.Zy_TItle .fontLabel`，选项取 `li.before-after`（字母 `.num_option` + 正文 `a.after`），点击 `li` 触发 `addChoice`；填空通过 MAIN world 内容脚本调用 UEditor 的 `window.UE.getEditor(id).setContent()`。
 - **策略模式**：`BaseStrategy` 实现通用 DOM 解析与填涂；平台子类只声明选择器，页面改版时单点修改。
@@ -530,6 +540,7 @@ npm run build      # 类型检查 + 生产构建
 - OCR + 独立视觉服务：主模型 `mock-main`、视觉服务 `mock-vision`；2 张图片各发一次 `/vision` 请求（带视觉 Key），答题请求只发 `/main` 且不含图片，题干已包含 `【图片文字】`，3/3 填涂
 - OCR 留空回退：视觉三项留空后，识别请求与答题请求都走主模型 Base URL / Key；主模型收到图片并返回转写文字，随后文本请求正常答题
 - 预设与测试识图：选择「智谱免费视觉」正确填充 `https://open.bigmodel.cn/api/paas/v4` + `glm-4.1v-thinking-flash`；「测试识图」成功返回识别文本与耗时
+- 安全加固（0.6.1）：页面侧 `host.shadowRoot === null`，light DOM 中搜不到 Key；保存后面板 Key 输入框为空、状态显示「已配置」；页面级 `keydown` 监听收不到面板内按键；401 响应回显的 Key 在日志与提示中均被替换为 `***`
 
 ---
 
@@ -537,7 +548,8 @@ npm run build      # 类型检查 + 生产构建
 
 | 版本 | 主要变化 |
 | --- | --- |
-| 0.6.0（当前） | 多层嵌套 iframe 递归解析 / 填涂 / 交卷；学习通作业 / 考试页策略；UEditor 主世界写入；交卷警告跨 frame 回传 |
+| 0.6.1（当前） | 安全加固：面板改为 `closed` Shadow DOM；API Key 只写不读、只存 Background；Background 校验消息来源；错误信息 Key 脱敏；图片代理不再携带 Cookie |
+| 0.6.0 | 多层嵌套 iframe 递归解析 / 填涂 / 交卷；学习通作业 / 考试页策略；UEditor 主世界写入；交卷警告跨 frame 回传 |
 | 0.5.0 | 图片题、OCR、独立视觉服务配置、智慧树组合题 / 分页作业页、交卷警告拦截 |
 | 早期版本 | 工程脚手架、Shadow DOM 面板、题目解析、LLM 代理、iframe 跨域填涂、自动交卷安全闸门 |
 

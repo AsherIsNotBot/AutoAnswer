@@ -24,7 +24,23 @@ function mount(): void {
   host.style.cssText =
     'all: initial; position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;'
 
-  const shadowRoot = host.attachShadow({ mode: 'open' })
+  // closed：页面脚本无法通过 host.shadowRoot 读取面板（含 API Key）
+  const shadowRoot = host.attachShadow({ mode: 'closed' })
+
+  // 防御性：阻止面板内的键盘 / 剪贴板事件冒泡到页面。
+  // 注意这挡不住 document 捕获阶段的监听，但能挡住常见的冒泡式键盘记录。
+  for (const type of [
+    'keydown',
+    'keyup',
+    'keypress',
+    'beforeinput',
+    'input',
+    'paste',
+    'copy',
+    'cut',
+  ]) {
+    shadowRoot.addEventListener(type, (event) => event.stopPropagation())
+  }
 
   const style = document.createElement('style')
   style.textContent = styles

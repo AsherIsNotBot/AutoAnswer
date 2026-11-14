@@ -1,4 +1,10 @@
-import type { ErrorCode, LlmPayload, Req, Res } from '../types'
+import type {
+  ErrorCode,
+  LlmPayload,
+  LlmResponseData,
+  Req,
+  Res,
+} from '../types'
 
 export class LlmError extends Error {
   constructor(
@@ -35,9 +41,9 @@ function shouldRetryWithoutImages(error: { code: ErrorCode; message: string }): 
 }
 
 /** 向 background 发消息，任何失败都归一化为 Res，不向调用方抛原始异常。 */
-export async function sendMessage(req: Req): Promise<Res> {
+export async function sendMessage<T = LlmResponseData>(req: Req): Promise<Res<T>> {
   try {
-    const res = (await chrome.runtime.sendMessage(req)) as Res | undefined
+    const res = (await chrome.runtime.sendMessage(req)) as Res<T> | undefined
     if (!res) {
       return { ok: false, error: { code: 'UNKNOWN', message: '后台无响应，请重载扩展后重试' } }
     }

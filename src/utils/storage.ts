@@ -1,4 +1,4 @@
-import type { Settings } from '../types'
+import type { PanelSettings, PublicSettings, Settings } from '../types'
 
 const SETTINGS_KEY = 'autoAnswer.settings'
 
@@ -12,6 +12,32 @@ export const DEFAULT_SETTINGS: Settings = {
   visionBaseUrl: '',
   visionApiKey: '',
   visionModel: '',
+}
+
+/** 面板初始值：只包含非敏感字段，避免把 Key 带进内容脚本状态。 */
+export const DEFAULT_PANEL_SETTINGS: PanelSettings = {
+  baseUrl: DEFAULT_SETTINGS.baseUrl,
+  model: DEFAULT_SETTINGS.model,
+  autoSubmit: DEFAULT_SETTINGS.autoSubmit,
+  enableImages: DEFAULT_SETTINGS.enableImages,
+  imageMode: DEFAULT_SETTINGS.imageMode,
+  visionBaseUrl: DEFAULT_SETTINGS.visionBaseUrl,
+  visionModel: DEFAULT_SETTINGS.visionModel,
+}
+
+/** 剥离 Key，只保留面板需要的字段和「是否已配置」标记。 */
+export function toPublicSettings(settings: Settings): PublicSettings {
+  return {
+    baseUrl: settings.baseUrl,
+    model: settings.model,
+    autoSubmit: settings.autoSubmit,
+    enableImages: settings.enableImages,
+    imageMode: settings.imageMode,
+    visionBaseUrl: settings.visionBaseUrl,
+    visionModel: settings.visionModel,
+    hasApiKey: Boolean(settings.apiKey),
+    hasVisionApiKey: Boolean(settings.visionApiKey),
+  }
 }
 
 function normalize(input: Partial<Settings>): Settings {

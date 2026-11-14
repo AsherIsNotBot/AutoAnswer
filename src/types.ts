@@ -19,6 +19,27 @@ export interface Settings {
   visionModel: string
 }
 
+/** 面板可编辑、可回显的非敏感设置。 */
+export interface PanelSettings {
+  baseUrl: string
+  model: string
+  autoSubmit: boolean
+  enableImages: boolean
+  imageMode: ImageMode
+  visionBaseUrl: string
+  visionModel: string
+}
+
+/** 返回给内容脚本的设置：不含任何 Key，只告知是否已配置。 */
+export interface PublicSettings extends PanelSettings {
+  hasApiKey: boolean
+  hasVisionApiKey: boolean
+}
+
+export type PublicSettingsPatch = Partial<PanelSettings>
+
+export type SecretField = 'apiKey' | 'visionApiKey'
+
 export type QuestionType =
   | 'single'
   | 'multiple'
@@ -101,9 +122,22 @@ export interface LlmPayload {
 
 export type Req =
   | { type: 'PING' }
+  | { type: 'GET_PUBLIC_SETTINGS' }
+  | { type: 'SAVE_PUBLIC_SETTINGS'; patch: PublicSettingsPatch }
+  | { type: 'SET_SECRET'; field: SecretField; value: string }
   | { type: 'LLM_CHAT'; payload: LlmPayload }
   | { type: 'FETCH_IMAGE'; payload: { url: string } }
 
-export type Res =
-  | { ok: true; data: { content: string; model?: string; mimeType?: string } }
+export interface LlmResponseData {
+  content: string
+  model?: string
+  mimeType?: string
+}
+
+export interface PublicSettingsResponseData {
+  settings: PublicSettings
+}
+
+export type Res<T = LlmResponseData> =
+  | { ok: true; data: T }
   | { ok: false; error: { code: ErrorCode; message: string } }

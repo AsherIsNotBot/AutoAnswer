@@ -1,5 +1,12 @@
-import type { ErrorCode, LlmPayload, Req, Res } from '../types'
-import { getSettings } from '../utils/storage'
+import type {
+  ErrorCode,
+  LlmPayload,
+  Req,
+  Res,
+  SecretField,
+  Settings,
+} from '../types'
+import { getSettings, saveSettings, toPublicSettings } from '../utils/storage'
 
 const REQUEST_TIMEOUT_MS = 60_000
 const IMAGE_TIMEOUT_MS = 15_000
@@ -17,10 +24,70 @@ class AppError extends Error {
   }
 }
 
-function toErrorPayload(error: unknown): { code: ErrorCode; message: string } {
-  if (error instanceof AppError) return { code: error.code, message: error.message }
-  if (error instanceof Error) return { code: 'UNKNOWN', message: error.message }
-  return { code: 'UNKNOWN', message: String(error) }
+/** 只接受本扩展的内容脚本 / 扩展页面发来的消息。 */
+const TRUSTED_HOST = /(^|\.)(chaoxing|zhihuishu)\.com$/i
+
+function isTrustedSender(sender: chrome.runtime.MessageSender): boolean {
+  if (sender.id !== chrome.runtime.id) return false
+
+  const url = sender.url ?? sender.tab?.url ?? ''
+  if (url.startsWith(`chrome-extension://${chrome.runtime.id}/`)) return true
+
+  try {
+    return TRUSTED_HOST.test(new URL(url).hostname)
+  } catch {
+    return false
+  }
+}
+
+/** 错误信息可能回显 Key（部分服务商会带 Key 片段），返回前统一脱敏。 */
+function redactSecrets(text: string, secrets: string[] = []): string {
+  let result = text
+  for (const secret of secrets) {
+    const value = secret.trim()
+    if (value.length >= 6) result = result.split(value).join('***')
+  }
+  return result.replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, 'sk-***')
+}
+
+function toErrorPayload(
+  error: unknown,
+  secrets: string[] = [],
+): { code: ErrorCode; message: string } {
+  let code: ErrorCode = 'UNKNOWN'
+  let message = String(error)
+
+  if (error instanceof AppError) {
+    code = error.code
+    message = error.message
+  } else if (error instanceof Error) {
+    message = error.message
+  }
+
+  return { code, message: redactSecrets(message, secrets) }
+}
+
+/** 只允许面板修改非敏感字段，Key 必须走 SET_SECRET。 */
+function sanitizePublicPatch(input: unknown): Partial<Settings> {
+  const patch =
+    input && typeof input === 'object' ? (input as Record<string, unknown>) : {}
+  const next: Partial<Settings> = {}
+
+  if (typeof patch.baseUrl === 'string') next.baseUrl = patch.baseUrl
+  if (typeof patch.model === 'string') next.model = patch.model
+  if (typeof patch.autoSubmit === 'boolean') next.autoSubmit = patch.autoSubmit
+  if (typeof patch.enableImages === 'boolean') next.enableImages = patch.enableImages
+  if (patch.imageMode === 'ocr' || patch.imageMode === 'direct') {
+    next.imageMode = patch.imageMode
+  }
+  if (typeof patch.visionBaseUrl === 'string') next.visionBaseUrl = patch.visionBaseUrl
+  if (typeof patch.visionModel === 'string') next.visionModel = patch.visionModel
+
+  return next
+}
+
+function isSecretField(value: unknown): value is SecretField {
+  return value === 'apiKey' || value === 'visionApiKey'
 }
 
 /** 兼容用户填 ".../v1"、".../v1/" 或完整 ".../chat/completions"。 */
@@ -246,7 +313,8 @@ async function handleFetchImage(url: string): Promise<{ content: string; mimeTyp
   let response: Response
   try {
     response = await fetch(parsed.toString(), {
-      credentials: 'include',
+      // 不携带目标站 Cookie：只抓题目图片，避免把无关的登录态带给第三方
+      credentials: 'omit',
       signal: controller.signal,
       cache: 'force-cache',
     })
@@ -281,16 +349,81 @@ async function handleFetchImage(url: string): Promise<{ content: string; mimeTyp
 }
 
 chrome.runtime.onMessage.addListener(
-  (request: Req, _sender, sendResponse: (response: Res) => void) => {
+  (request: Req, sender, sendResponse: (response: Res<unknown>) => void) => {
+    if (!isTrustedSender(sender)) {
+      sendResponse({
+        ok: false,
+        error: { code: 'UNKNOWN', message: '消息来源不受信任' },
+      })
+      return false
+    }
+
     if (request?.type === 'PING') {
       sendResponse({ ok: true, data: { content: 'pong' } })
       return false
     }
 
+    if (request?.type === 'GET_PUBLIC_SETTINGS') {
+      getSettings()
+        .then((settings) =>
+          sendResponse({ ok: true, data: { settings: toPublicSettings(settings) } }),
+        )
+        .catch((error) => sendResponse({ ok: false, error: toErrorPayload(error) }))
+      return true
+    }
+
+    if (request?.type === 'SAVE_PUBLIC_SETTINGS') {
+      saveSettings(sanitizePublicPatch(request.patch))
+        .then((settings) =>
+          sendResponse({ ok: true, data: { settings: toPublicSettings(settings) } }),
+        )
+        .catch((error) => sendResponse({ ok: false, error: toErrorPayload(error) }))
+      return true
+    }
+
+    if (request?.type === 'SET_SECRET') {
+      if (!isSecretField(request.field)) {
+        sendResponse({
+          ok: false,
+          error: { code: 'UNKNOWN', message: '未知的 Key 字段' },
+        })
+        return false
+      }
+
+      const value = String(request.value ?? '').trim()
+      if (value.length > 4000) {
+        sendResponse({
+          ok: false,
+          error: { code: 'UNKNOWN', message: 'Key 过长' },
+        })
+        return false
+      }
+
+      const patch: Partial<Settings> =
+        request.field === 'apiKey' ? { apiKey: value } : { visionApiKey: value }
+
+      saveSettings(patch)
+        .then((settings) =>
+          sendResponse({ ok: true, data: { settings: toPublicSettings(settings) } }),
+        )
+        .catch((error) => sendResponse({ ok: false, error: toErrorPayload(error) }))
+      return true
+    }
+
     if (request?.type === 'LLM_CHAT') {
       handleChat(request.payload)
         .then((data) => sendResponse({ ok: true, data }))
-        .catch((error) => sendResponse({ ok: false, error: toErrorPayload(error) }))
+        .catch(async (error) => {
+          // 错误体可能回显 Key，读取当前配置做精确脱敏
+          const settings = await getSettings().catch(() => null)
+          sendResponse({
+            ok: false,
+            error: toErrorPayload(
+              error,
+              settings ? [settings.apiKey, settings.visionApiKey] : [],
+            ),
+          })
+        })
       return true // 保持消息通道，等待异步 fetch
     }
 
