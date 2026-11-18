@@ -149,11 +149,38 @@ export class ZhiHuiShuStrategy extends BaseStrategy {
   }
 
   private activeIndex(): number {
-    return this.answerCardItems().findIndex(
+    const items = this.answerCardItems()
+    const byClass = items.findIndex(
       (item) =>
         item.classList.contains('greenbordercur') ||
         item.classList.contains('greenborder'),
     )
+    if (byClass >= 0) return byClass
+
+    // 兜底：部分页面切换后只更新题号文字，不保留当前项高亮 class
+    const title = this.questionTitle()
+    const number = title.match(/^\s*(\d+)/)?.[1]
+    if (!number) return -1
+    return items.findIndex((item) => this.normalize(item.textContent) === number)
+  }
+
+  private questionTitle(): string {
+    const titles = [...document.querySelectorAll<HTMLElement>('.questionBox .questionTit')]
+    return this.normalize(titles.at(-1)?.textContent)
+  }
+
+  /** 导航后等待题干真正换掉，并留出选项渲染时间，避免在加载中间填涂 */
+  private async waitForQuestionSettled(
+    previousTitle: string,
+    timeoutMs = 6000,
+  ): Promise<boolean> {
+    const changed = await this.waitFor(
+      () => this.questionTitle() !== previousTitle,
+      timeoutMs,
+    )
+    if (!changed) return false
+    await new Promise((resolve) => window.setTimeout(resolve, 300))
+    return true
   }
 
   /** 签名必须包含当前子题，否则组合题 1.1 → 1.2 会被误判为“没变化” */
@@ -182,37 +209,83 @@ export class ZhiHuiShuStrategy extends BaseStrategy {
     )
   }
 
-  override async goToFirst(): Promise<void> {
-    // 优先点答题卡第 1 项，兼容组合题的 1.1 / 1.2
-    const firstItem = this.answerCardItems()[0]
-    if (firstItem) {
-      if (this.activeIndex() === 0) return
+  /** 已答题会在答题卡上带 greenbgcur；优先从第一道未答题开始，避免覆盖已有答案 */
+  private firstTargetIndex(): number {
+    const items = this.answerCardItems()
+    const firstUnanswered = items.findIndex(
+      (item) => !item.classList.contains('greenbgcur'),
+    )
+    return firstUnanswered >= 0 ? firstUnanswered : 0
+  }
 
-      const before = this.currentSignature()
-      firstItem.click()
-      const moved = await this.waitFor(
-        () => this.activeIndex() === 0 || this.currentSignature() !== before,
-        4000,
-      )
-      if (moved) {
-        await new Promise((resolve) => window.setTimeout(resolve, 300))
-        return
+  override async goToFirst(): Promise<void> {
+    this.startFailed = false
+    this.lastNotice = ''
+
+    const items = this.answerCardItems()
+    const target = this.firstTargetIndex()
+    this.startIndex = target
+    if (items.length === 0 || this.activeIndex() === target) return
+
+    const targetItem = items[target]
+    if (!targetItem) return
+
+    // 优先点答题卡目标项；只等题干真正切换，不能只等 class 变化
+    const beforeTitle = this.questionTitle()
+    const before = this.currentSignature()
+    const current = this.activeIndex()
+    targetItem.click()
+    const moved = await this.waitFor(
+      () =>
+        this.questionTitle() !== beforeTitle ||
+        this.activeIndex() === target ||
+        this.currentSignature() !== before,
+      4000,
+    )
+    if (moved) {
+      const settled = await this.waitForQuestionSettled(beforeTitle, 5000)
+      if (!settled) {
+        this.startFailed = true
+        this.lastNotice = '起始题目加载超时，已停止本次答题（未交卷），请等待页面加载完成后重试'
+      }
+      return
+    }
+
+    const blocked = this.visibleDialog()
+    if (blocked) {
+      const text = this.dialogText(blocked)
+      this.lastNotice = `切换题目时出现平台弹窗，已停止本次答题：${text.slice(0, 80)}`
+      this.closeDialog(blocked)
+      this.startFailed = true
+      return
+    }
+
+    // 只有目标在当前题之前时，才允许用「上一题」少量回退
+    if (target < current) {
+      const maxClicks = Math.min(current - target, 30)
+      for (let i = 0; i < maxClicks; i += 1) {
+        if (this.activeIndex() === target) return
+
+        const prev = this.enabledSwitcher('上一题')
+        if (!prev) break
+
+        const title = this.questionTitle()
+        prev.click()
+        const changed = await this.waitFor(() => this.questionTitle() !== title, 800)
+        if (!changed) break
+        await this.waitForQuestionSettled(title, 3000)
       }
     }
 
-    // 兜底：连续点「上一题」直到按钮置灰
-    for (let i = 0; i < 100; i += 1) {
-      const prev = this.enabledSwitcher('上一题')
-      if (!prev) break
-      const before = this.currentSignature()
-      prev.click()
-      const changed = await this.waitFor(() => this.currentSignature() !== before, 2000)
-      if (!changed) break
-      await new Promise((resolve) => window.setTimeout(resolve, 150))
+    if (this.activeIndex() !== target) {
+      this.startFailed = true
+      this.lastNotice = `无法可靠定位到第 ${target + 1} 题，已停止本次答题（未交卷）。请手动点击答题卡后重试。`
     }
   }
 
   override async nextQuestion(): Promise<NextQuestionResult> {
+    this.lastNotice = ''
+
     const items = this.answerCardItems()
     const index = this.activeIndex()
 
@@ -224,18 +297,54 @@ export class ZhiHuiShuStrategy extends BaseStrategy {
       return items.length === 0 ? 'last' : 'failed'
     }
 
-    const before = this.currentSignature()
+    const beforeTitle = this.questionTitle()
+    const beforeIndex = index
     next.click()
 
+    // 等待题干切换；同时留意平台弹窗（例如未保存/未作答提示）
     const changed = await this.waitFor(
-      () => this.currentSignature() !== before,
-      8000,
+      () =>
+        this.questionTitle() !== beforeTitle ||
+        this.activeIndex() !== beforeIndex ||
+        !!this.visibleDialog(),
+      5000,
     )
-    if (!changed) return 'failed'
 
-    // 题干渲染与选项加载可能分两步完成
-    await new Promise((resolve) => window.setTimeout(resolve, 350))
+    const dialog = this.visibleDialog()
+    if (dialog) {
+      const text = this.dialogText(dialog)
+      this.lastNotice = this.isIncompleteWarning(text)
+        ? `平台提示存在未完成题目，已停止自动答题：${text.slice(0, 80)}`
+        : `切换下一题时出现平台弹窗，已停止自动答题：${text.slice(0, 80)}`
+      this.closeDialog(dialog)
+      return 'failed'
+    }
+
+    if (!changed) {
+      this.lastNotice = '点击「下一题」后页面没有切换到新题目，已停止（未交卷）'
+      return 'failed'
+    }
+
+    // 题干已切换，再等选项/输入框渲染完成，避免在加载中间填涂
+    const settled = await this.waitForQuestionSettled(beforeTitle, 5000)
+    if (!settled) {
+      this.lastNotice = '下一题加载超时，已停止（未交卷），请等待页面加载完成后重试'
+      return 'failed'
+    }
     return 'moved'
+  }
+
+  /** 只关闭提示类弹窗，绝不点「提交 / 确定」 */
+  private closeDialog(dialog: HTMLElement): void {
+    const buttons = [...dialog.querySelectorAll<HTMLElement>('button, a')]
+    const safe = buttons.find((button) =>
+      /取消|我知道了|关闭|返回/.test(button.textContent ?? ''),
+    )
+    if (safe) {
+      safe.click()
+      return
+    }
+    dialog.querySelector<HTMLElement>('.el-dialog__headerbtn')?.click()
   }
 
   private visibleDialog(): HTMLElement | null {

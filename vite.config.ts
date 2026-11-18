@@ -5,7 +5,7 @@ import { crx, defineManifest } from '@crxjs/vite-plugin'
 const manifest = defineManifest({
   manifest_version: 3,
   name: 'Auto Answer AI',
-  version: '0.6.1',
+  version: '0.6.2',
   description: '悬浮式在线答题辅助面板（学习通 / 智慧树）',
   permissions: ['storage'],
   // 用户可自定义任意 LLM baseUrl，只能放宽到全部站点；实际请求只由 background 发出

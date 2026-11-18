@@ -58,6 +58,7 @@ const saving = ref(false)
 const testing = ref(false)
 const testingVision = ref(false)
 const running = ref(false)
+const stopRequested = ref(false)
 const platformName = ref(createStrategy(location.host)?.platform ?? '')
 const visionPreset = ref('custom')
 
@@ -97,7 +98,11 @@ let logSeq = 0
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
 const progress = reactive({ total: 0, filled: 0, skipped: 0, failed: 0 })
-const processed = computed(() => progress.filled + progress.skipped + progress.failed)
+/** 智慧树分页页面上，本次开始前答题卡已显示作答的题数（不重复处理） */
+const preAnswered = ref(0)
+const processed = computed(
+  () => progress.filled + progress.skipped + progress.failed + preAnswered.value,
+)
 const barWidth = computed(() =>
   progress.total > 0 ? `${Math.round((processed.value / progress.total) * 100)}%` : '0%',
 )
@@ -401,6 +406,13 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
+/** 停止本轮答题：不取消已在途的模型请求，但不再继续下一题，也不会交卷 */
+function onStop(): void {
+  if (!running.value) return
+  stopRequested.value = true
+  addLog('warn', '已请求停止：当前请求结束后停止，且不会自动交卷')
+}
+
 let visionFallbackNotified = false
 
 async function prepareQuestionImageSet(
@@ -458,15 +470,42 @@ async function runPaged(strategy: BaseStrategy): Promise<void> {
     'info',
     `检测到分页答题页（${total > 0 ? `共 ${total} 题` : '题数未知'}），逐题请求模型…`,
   )
+  addLog('info', '正在定位第一题…')
 
   await strategy.goToFirst()
-  await delay(300)
+  if (strategy.startFailed) {
+    addLog('warn', strategy.lastNotice || '无法定位到第一题，已停止（未交卷）')
+    await finishRun(strategy, [], true)
+    return
+  }
+  preAnswered.value = strategy.startIndex
+  if (strategy.startIndex > 0) {
+    addLog(
+      'info',
+      `答题卡显示前 ${strategy.startIndex} 题已答，本次从第 ${strategy.startIndex + 1} 题开始（不重复处理已答题）`,
+    )
+  }
+  addLog('info', `已定位到第 ${strategy.startIndex + 1} 题，开始逐题处理`)
 
-  const maxPages = 200
+  // 页面题数已知时按题数封顶，避免异常页面无限翻页
+  const maxPages = total > 0 ? total + 2 : 50
+  const deadline = Date.now() + 15 * 60_000
   let page = 0
   let aborted = false
+  let emptyPages = 0
 
   for (; page < maxPages; page += 1) {
+    if (stopRequested.value) {
+      aborted = true
+      addLog('info', '已按请求停止答题（未交卷）')
+      break
+    }
+    if (Date.now() > deadline) {
+      aborted = true
+      addLog('warn', '已超过 15 分钟，停止本轮答题（未交卷）')
+      break
+    }
+
     let questions = strategy.parseQuestions()
     if (questions.length === 0) {
       await delay(400)
@@ -474,9 +513,16 @@ async function runPaged(strategy: BaseStrategy): Promise<void> {
     }
 
     if (questions.length === 0) {
+      emptyPages += 1
       progress.skipped += 1
       addLog('warn', `第 ${page + 1} 页未解析到题目，尝试切到下一题`)
+      if (emptyPages >= 3) {
+        aborted = true
+        addLog('warn', '连续 3 页未解析到题目，已停止（未交卷）')
+        break
+      }
     } else {
+      emptyPages = 0
       const question = questions[0]
       const task: RoutedQuestion = {
         id: question.id,
@@ -485,6 +531,9 @@ async function runPaged(strategy: BaseStrategy): Promise<void> {
         question,
         platform: strategy.platform,
       }
+
+      // 分页页面一题一次请求，先写日志，避免长请求期间看起来像卡死
+      addLog('info', `${taskLabel(task)} 正在请求模型…`)
 
       try {
         await prepareQuestionImageSet([question], `${taskLabel(task)} `)
@@ -521,13 +570,25 @@ async function runPaged(strategy: BaseStrategy): Promise<void> {
       if (progress.total === 0) progress.total = page + 1
     }
 
+    if (stopRequested.value) {
+      aborted = true
+      addLog('info', '已按请求停止答题（未交卷）')
+      break
+    }
+
     const nav = await strategy.nextQuestion()
     if (nav === 'failed') {
       aborted = true
-      addLog('error', '切换下一题失败，已停止（未交卷），请检查页面是否加载完成')
+      addLog(
+        'error',
+        strategy.lastNotice ||
+          '切换下一题失败，已停止（未交卷），请检查页面是否加载完成',
+      )
       break
     }
     if (nav === 'last') break
+    // 给页面留出渲染/自动保存时间，避免连续快速切换拖慢页面
+    await delay(200)
   }
 
   if (page >= maxPages) {
@@ -546,28 +607,41 @@ async function finishRun(
 ): Promise<void> {
   const complete =
     !aborted &&
+    !stopRequested.value &&
     progress.total > 0 &&
-    progress.filled === progress.total &&
+    progress.filled + preAnswered.value === progress.total &&
     progress.skipped === 0 &&
     progress.failed === 0
+
+  const preNote =
+    preAnswered.value > 0 ? ` · 另有 ${preAnswered.value} 题此前已答` : ''
 
   if (!complete) {
     addLog(
       'warn',
-      `答题未完成：已填 ${progress.filled}/${progress.total || '?'} · 跳过 ${progress.skipped} · 失败 ${progress.failed}，已跳过自动交卷`,
+      `答题未完成：已填 ${progress.filled}/${progress.total || '?'}${preNote} · 跳过 ${progress.skipped} · 失败 ${progress.failed}，已跳过自动交卷`,
     )
     return
   }
 
   addLog(
     'ok',
-    `答题完成：已填 ${progress.filled} · 跳过 ${progress.skipped} · 失败 ${progress.failed}`,
+    `答题完成：已填 ${progress.filled}${preNote} · 跳过 ${progress.skipped} · 失败 ${progress.failed}`,
   )
 
   if (!form.autoSubmit) return
 
+  // 页面不在前台时不做阻塞式 confirm，避免用户看不到弹窗却卡住页面
+  if (document.visibilityState !== 'visible' || !document.hasFocus()) {
+    addLog('warn', '页面不在前台，已跳过自动交卷，请手动提交')
+    return
+  }
+
+  const answeredTotal = progress.filled + preAnswered.value
+  const preConfirm =
+    preAnswered.value > 0 ? `（本轮 ${progress.filled} 题，此前已答 ${preAnswered.value} 题）` : ''
   const confirmed = window.confirm(
-    `已填写 ${progress.filled}/${progress.total} 道题，确定现在交卷吗？`,
+    `已填写 ${answeredTotal}/${progress.total} 道题${preConfirm}，确定现在交卷吗？`,
   )
   if (!confirmed) {
     addLog('info', '已取消自动交卷')
@@ -619,12 +693,14 @@ async function onStart(): Promise<void> {
   }
 
   running.value = true
+  stopRequested.value = false
   tab.value = 'console'
   platformName.value = strategy.platform
   progress.total = 0
   progress.filled = 0
   progress.skipped = 0
   progress.failed = 0
+  preAnswered.value = 0
   resetVisionState()
   visionFallbackNotified = false
   ocrDisabled = false
@@ -779,13 +855,22 @@ async function onStart(): Promise<void> {
       }
     }
 
+    // 用户已请求停止：不再填涂，也不交卷
+    if (stopRequested.value) {
+      addLog('info', '已按请求停止答题（未交卷）')
+      await finishRun(strategy, [...frameFills.keys()], true, ownQuestions.length > 0)
+      return
+    }
+
     // 当前页面直接填涂
     for (const { task, answer } of topFills) {
+      if (stopRequested.value) break
       applyFillResult(task, strategy.fillAnswer(task.question, answer))
     }
 
     // 逐个 iframe 批量填涂
     for (const [frame, items] of frameFills) {
+      if (stopRequested.value) break
       const results = await fillInFrame(
         frame,
         items.map((item) => ({ ...item.answer, id: item.task.localId })),
@@ -806,7 +891,12 @@ async function onStart(): Promise<void> {
       }
     }
 
-    await finishRun(strategy, [...frameFills.keys()], false, ownQuestions.length > 0)
+    await finishRun(
+      strategy,
+      [...frameFills.keys()],
+      stopRequested.value,
+      ownQuestions.length > 0,
+    )
   } catch (error) {
     const message = describeError(error)
     addLog('error', `答题中断：${message}`)
@@ -1042,6 +1132,14 @@ onMounted(load)
           >
             {{ running ? '答题中…' : '启动答题' }}
           </button>
+          <button
+            v-if="running"
+            class="btn ghost"
+            type="button"
+            @click="onStop"
+          >
+            停止答题
+          </button>
           <button class="btn ghost" type="button" @click="clearLogs">清空日志</button>
         </div>
 
@@ -1053,6 +1151,7 @@ onMounted(load)
           <div class="bar"><i :style="{ width: barWidth }" /></div>
           <div class="status-meta">
             <span>已填 {{ progress.filled }}</span>
+            <span v-if="preAnswered > 0">此前已答 {{ preAnswered }}</span>
             <span>跳过 {{ progress.skipped }}</span>
             <span>失败 {{ progress.failed }}</span>
           </div>
@@ -1071,7 +1170,7 @@ onMounted(load)
         </ul>
       </section>
 
-      <footer class="footer">v0.6.1 · 仅用于被授权的练习环境</footer>
+      <footer class="footer">v0.6.2 · 仅用于被授权的练习环境</footer>
     </template>
   </div>
 </template>

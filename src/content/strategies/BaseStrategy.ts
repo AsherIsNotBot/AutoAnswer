@@ -157,6 +157,12 @@ export abstract class BaseStrategy {
   /** 交卷失败/被拦截时的提示，供 UI 记录 */
   lastNotice = ''
 
+  /** 分页页面无法可靠定位起始题目时置为 true，由编排层停止本次答题 */
+  startFailed = false
+
+  /** 分页页面本次开始的题目下标（0 起），用于日志与跳过已答题 */
+  startIndex = 0
+
   /** 组合题等结构可覆写：返回当前实际作答的子题容器 */
   protected getQuestionScope(container: HTMLElement): HTMLElement {
     return container
